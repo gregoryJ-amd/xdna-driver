@@ -29,7 +29,16 @@ MODULE_PARM_DESC(aie2_max_col, "Maximum column could be used");
  * The management mailbox channel is allocated by firmware.
  * The related register and ring buffer information is on SRAM BAR.
  * This struct is the register layout.
+ *
+ * Mgmt channel info query flow:
+ * 1. Poll alive pointer register until it is non zero
+ * 2. The alive pointer pointing to Mgmt Mbox Info on SRAM bar
+ * 4. Read x2i_* and i2x_*
+ * 3. If magic number MGMT_MBOX_MAGIC not presented, done;
+ * Otherwise, read msi_id, major, minor etc..
  */
+#define MGMT_MBOX_MAGIC 0x55504e5f /* _NPU */
+#define MAGIC_OFFSET offsetof(struct mgmt_mbox_chann_info, magic[0])
 struct mgmt_mbox_chann_info {
 	u32	x2i_tail;
 	u32	x2i_head;
@@ -39,7 +48,44 @@ struct mgmt_mbox_chann_info {
 	u32	i2x_head;
 	u32	i2x_buf;
 	u32	i2x_buf_sz;
+	u32	magic;
+	u32	msi_id;
+	u32	prot_major;
+	u32	prot_minor;
+	u32	rsvd[4];
 };
+
+int aie2_check_protocol(struct amdxdna_dev_hdl *ndev, u32 fw_major, u32 fw_minor)
+{
+	struct amdxdna_dev *xdna = ndev->xdna;
+
+	/*
+	 * The driver supported mailbox behavior is defined by
+	 * ndev->priv->protocol_major and protocol_minor.
+	 *
+	 * When major different, it means incompatible behavior.
+	 * When only minor different, the greater minor means more opcode etc.
+	 *
+	 * Thus,
+	 * 1. driver and fw major must be the same
+	 * 2. driver minor must smaller than or equal to fw minor
+	 */
+	if (ndev->priv->protocol_major != fw_major) {
+		XDNA_ERR(xdna, "Incompatible firmware protocol major %d minor %d",
+			 fw_major, fw_minor);
+		return -EINVAL;
+	}
+
+	/*
+	 * Greater protocol minor version means new messages/status/emun are
+	 * added into the firmware interface protocol.
+	 */
+	if (ndev->priv->protocol_minor > fw_minor) {
+		XDNA_ERR(xdna, "Firmware minor version smaller than supported");
+		return -EINVAL;
+	}
+	return 0;
+}
 
 static inline void aie2_dump_chann_info_debug(struct amdxdna_dev_hdl *ndev)
 {
@@ -54,6 +100,11 @@ static inline void aie2_dump_chann_info_debug(struct amdxdna_dev_hdl *ndev)
 	XDNA_DBG(xdna, "x2i ringbuf 0x%x", ndev->mgmt_x2i.rb_start_addr);
 	XDNA_DBG(xdna, "x2i rsize   0x%x", ndev->mgmt_x2i.rb_size);
 	XDNA_DBG(xdna, "x2i chann index 0x%x", ndev->mgmt_chan_idx);
+	if (!ndev->mgmt_prot_major)
+		return;
+
+	XDNA_DBG(xdna, "mailbox protocol major 0x%x", ndev->mgmt_prot_major);
+	XDNA_DBG(xdna, "mailbox protocol minor 0x%x", ndev->mgmt_prot_minor);
 }
 
 static int aie2_get_mgmt_chann_info(struct amdxdna_dev_hdl *ndev)
@@ -96,14 +147,25 @@ static int aie2_get_mgmt_chann_info(struct amdxdna_dev_hdl *ndev)
 	x2i->mb_tail_ptr_reg = AIE2_MBOX_OFF(ndev, info_regs.x2i_tail);
 	x2i->rb_start_addr   = AIE2_SRAM_OFF(ndev, info_regs.x2i_buf);
 	x2i->rb_size         = info_regs.x2i_buf_sz;
-	ndev->mgmt_chan_idx  = CHANN_INDEX(ndev, x2i->rb_start_addr);
 
+	if (info_regs.magic != MGMT_MBOX_MAGIC) {
+		ndev->mgmt_chan_idx = CHANN_INDEX(ndev, x2i->rb_start_addr);
+		goto done;
+	}
+
+	ndev->mgmt_chan_idx  = info_regs.msi_id;
+	ndev->mgmt_prot_major = info_regs.prot_major;
+	ndev->mgmt_prot_minor = info_regs.prot_minor;
+	if (aie2_check_protocol(ndev, ndev->mgmt_prot_major, ndev->mgmt_prot_minor))
+		ret = -EINVAL;
+
+done:
 	aie2_dump_chann_info_debug(ndev);
 
 	/* Must clear address at FW_ALIVE_OFF */
 	writel(0, SRAM_GET_ADDR(ndev, FW_ALIVE_OFF));
 
-	return 0;
+	return ret;
 }
 
 static int aie2_runtime_cfg(struct amdxdna_dev_hdl *ndev)
@@ -165,10 +227,12 @@ static int aie2_mgmt_fw_init(struct amdxdna_dev_hdl *ndev)
 {
 	int ret;
 
-	ret = aie2_check_protocol_version(ndev);
-	if (ret) {
-		XDNA_ERR(ndev->xdna, "Check header hash failed");
-		return ret;
+	if (!ndev->mgmt_prot_major) {
+		ret = aie2_check_protocol_version(ndev);
+		if (ret) {
+			XDNA_ERR(ndev->xdna, "Check protocol version failed");
+			return ret;
+		}
 	}
 
 	ret = aie2_runtime_cfg(ndev);
@@ -234,6 +298,21 @@ static void aie2_mgmt_fw_fini(struct amdxdna_dev_hdl *ndev)
 }
 
 /* TODO: move below two functions to aie2_ctx.c? */
+static int aie2_set_dpm_level(void *cb_arg, u32 dpm_level)
+{
+	struct amdxdna_hwctx *hwctx = cb_arg;
+	struct amdxdna_dev *xdna;
+	int ret;
+
+	xdna = hwctx->client->xdna;
+
+	ret = aie2_smu_set_dpm_level(xdna->dev_handle, dpm_level, true);
+	if (ret)
+		XDNA_ERR(xdna, "set dpm level failed, ret %d", ret);
+
+	return ret;
+}
+
 static int aie2_xrs_load(void *cb_arg, struct xrs_action_load *action)
 {
 	struct amdxdna_hwctx *hwctx = cb_arg;
@@ -269,6 +348,7 @@ static int aie2_xrs_unload(void *cb_arg)
 static struct xrs_action_ops aie2_xrs_actions = {
 	.load = aie2_xrs_load,
 	.unload = aie2_xrs_unload,
+	.set_dpm_level = aie2_set_dpm_level,
 };
 
 static void aie2_hw_stop(struct amdxdna_dev *xdna)
@@ -276,12 +356,15 @@ static void aie2_hw_stop(struct amdxdna_dev *xdna)
 	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 
+	aie2_pm_stop(ndev);
 	aie2_mgmt_fw_fini(ndev);
 	xdna_mailbox_stop_channel(ndev->mgmt_chann);
 	xdna_mailbox_destroy_channel(ndev->mgmt_chann);
 	ndev->mgmt_chann = NULL;
-	xdna_mailbox_destroy(ndev->mbox);
-	ndev->mbox = NULL;
+	if (ndev->mbox) {
+		xdna_mailbox_destroy(ndev->mbox);
+		ndev->mbox = NULL;
+	}
 	aie2_psp_stop(ndev->psp_hdl);
 	aie2_smu_stop(ndev);
 	pci_clear_master(pdev);
@@ -317,7 +400,7 @@ static int aie2_hw_start(struct amdxdna_dev *xdna)
 
 	ret = aie2_get_mgmt_chann_info(ndev);
 	if (ret) {
-		XDNA_ERR(xdna, "firmware is not alive");
+		XDNA_ERR(xdna, "firmware mgmt info ret %d", ret);
 		goto stop_psp;
 	}
 
@@ -355,6 +438,12 @@ static int aie2_hw_start(struct amdxdna_dev *xdna)
 	ret = aie2_mgmt_fw_init(ndev);
 	if (ret) {
 		XDNA_ERR(xdna, "initial mgmt firmware failed, ret %d", ret);
+		goto destroy_mgmt_chann;
+	}
+
+	ret = aie2_pm_start(ndev);
+	if (ret) {
+		XDNA_ERR(xdna, "failed to start power manager, ret %d", ret);
 		goto destroy_mgmt_chann;
 	}
 
@@ -486,6 +575,7 @@ skip_pasid:
 
 	aie2_smu_setup(ndev);
 
+	ndev->pw_mode = POWER_MODE_DEFAULT;
 	ret = aie2_hw_start(xdna);
 	if (ret) {
 		XDNA_ERR(xdna, "start npu failed, ret %d", ret);
@@ -499,10 +589,8 @@ skip_pasid:
 	}
 	ndev->total_col = min(aie2_max_col, ndev->metadata.cols);
 
-	xrs_cfg.clk_list.num_levels = 3;
-	xrs_cfg.clk_list.cu_clk_list[0] = 0;
-	xrs_cfg.clk_list.cu_clk_list[1] = 800;
-	xrs_cfg.clk_list.cu_clk_list[2] = 1000;
+	xrs_cfg.clk_list.num_levels = ndev->priv->smu_npu_dpm_levels;
+	xrs_cfg.clk_list.cu_clk_list = ndev->priv->smu_npu_dpm_clk_table;
 	xrs_cfg.sys_eff_factor = 1;
 	xrs_cfg.dev = xdna->ddev.dev;
 	xrs_cfg.actions = &aie2_xrs_actions;
@@ -697,6 +785,22 @@ static int aie2_get_firmware_version(struct amdxdna_client *client,
 	return 0;
 }
 
+static int aie2_get_power_mode(struct amdxdna_client *client,
+			       struct amdxdna_drm_get_info *args)
+{
+	struct amdxdna_drm_get_power_mode mode;
+	struct amdxdna_dev *xdna = client->xdna;
+	struct amdxdna_dev_hdl *ndev;
+
+	ndev = xdna->dev_handle;
+	mode.power_mode = ndev->pw_mode;
+
+	if (copy_to_user(u64_to_user_ptr(args->buffer), &mode, sizeof(mode)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static int aie2_get_clock_metadata(struct amdxdna_client *client,
 				   struct amdxdna_drm_get_info *args)
 {
@@ -851,6 +955,9 @@ static int aie2_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_i
 	case DRM_AMDXDNA_QUERY_FIRMWARE_VERSION:
 		ret = aie2_get_firmware_version(client, args);
 		break;
+	case DRM_AMDXDNA_GET_POWER_MODE:
+		ret = aie2_get_power_mode(client, args);
+		break;
 	default:
 		XDNA_ERR(xdna, "Not supported request parameter %u", args->param);
 		ret = -EOPNOTSUPP;
@@ -864,6 +971,7 @@ static int aie2_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_i
 static int aie2_set_power_mode(struct amdxdna_client *client, struct amdxdna_drm_set_state *args)
 {
 	struct amdxdna_drm_set_power_mode power_state;
+	enum amdxdna_power_mode_type power_mode;
 	struct amdxdna_dev *xdna = client->xdna;
 
 	if (args->buffer_size != sizeof(power_state)) {
@@ -878,11 +986,13 @@ static int aie2_set_power_mode(struct amdxdna_client *client, struct amdxdna_drm
 	}
 
 	/* Interpret the given buf->power_mode into the correct power mode*/
+	power_mode = power_state.power_mode;
+	if (power_mode > POWER_MODE_HIGH) {
+		XDNA_ERR(xdna, "Invalid power mode %d", power_mode);
+		return -EINVAL;
+	}
 
-	/* Set resource solver power property to the user choice */
-
-	/* Set power level within the device */
-	return -EOPNOTSUPP;
+	return aie2_pm_set_mode(xdna->dev_handle, power_mode);
 }
 
 static int aie2_set_state(struct amdxdna_client *client, struct amdxdna_drm_set_state *args)

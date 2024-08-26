@@ -11,6 +11,7 @@
 #include <linux/io.h>
 #include <drm/gpu_scheduler.h>
 
+#include "drm_local/amdxdna_accel.h"
 #include "amdxdna_pci_drv.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
@@ -18,6 +19,9 @@
 #ifdef AMDXDNA_DEVEL
 #include "amdxdna_devel.h"
 #endif
+
+#define SMU_REVISION_V0 0x0
+#define SMU_REVISION_V1 0x1
 
 #define AIE2_INTERVAL	20000	/* us */
 #define AIE2_TIMEOUT	1000000	/* us */
@@ -70,6 +74,9 @@
 #define SMU_DPM_MAX(ndev) \
 	((ndev)->priv->smu_dpm_max)
 
+#define SMU_NPU_DPM_TABLE_ENTRY(ndev, level) \
+	(&ndev->priv->smu_npu_dpm_clk_table[level])
+
 enum aie2_smu_reg_idx {
 	SMU_CMD_REG = 0,
 	SMU_ARG_REG,
@@ -95,6 +102,23 @@ enum psp_reg_idx {
 	PSP_STATUS_REG,
 	PSP_RESP_REG,
 	PSP_MAX_REGS /* Keep this at the end */
+};
+
+enum dpm_level {
+	DPM_LEVEL_0=0,
+	DPM_LEVEL_1,
+	DPM_LEVEL_2,
+	DPM_LEVEL_3,
+	DPM_LEVEL_4,
+	DPM_LEVEL_5,
+	DPM_LEVEL_6,
+	DPM_LEVEL_7,
+	DPM_LEVEL_MAX,
+};
+
+struct dpm_clk {
+	u32 npuclk;
+	u32 hclk;
 };
 
 struct psp_config {
@@ -138,15 +162,10 @@ struct clock {
 struct smu {
 	struct clock		mp_npu_clock;
 	struct clock		h_clock;
-	u32			dpm_level;
+	u32			curr_dpm_level;
 #define SMU_POWER_OFF 0
 #define SMU_POWER_ON  1
 	u32			power_state;
-};
-
-struct rt_config {
-	u32	type;
-	u32	value;
 };
 
 #ifdef AMDXDNA_DEVEL
@@ -195,11 +214,15 @@ struct amdxdna_dev_hdl {
 	struct xdna_mailbox_chann_res	mgmt_x2i;
 	struct xdna_mailbox_chann_res	mgmt_i2x;
 	u32				mgmt_chan_idx;
+	u32				mgmt_prot_major;
+	u32				mgmt_prot_minor;
 
 	u32				total_col;
+	u32				smu_curr_dpm_level;
 	struct aie_version		version;
 	struct aie_metadata		metadata;
 	struct smu			smu;
+	enum amdxdna_power_mode_type	pw_mode;
 
 	/* Mailbox and the management channel */
 	struct mailbox			*mbox;
@@ -213,6 +236,18 @@ struct amdxdna_dev_hdl {
 struct aie2_bar_off_pair {
 	int	bar_idx;
 	u32	offset;
+};
+
+struct rt_config {
+	u32	type;
+	u32	value;
+};
+
+struct rt_config_clk_gating {
+	const u32	*types;
+	u32		num_types;
+	u32		value_enable;
+	u32		value_disable;
 };
 
 struct amdxdna_dev_priv {
@@ -231,10 +266,14 @@ struct amdxdna_dev_priv {
 	struct aie2_bar_off_pair	sram_offs[SRAM_MAX_INDEX];
 	struct aie2_bar_off_pair	psp_regs_off[PSP_MAX_REGS];
 	struct aie2_bar_off_pair	smu_regs_off[SMU_MAX_REGS];
+	struct rt_config_clk_gating	clk_gating;
 	u32				smu_mpnpuclk_freq_max;
 	u32				smu_hclk_freq_max;
 	/* npu1: 0, not support dpm; npu2+: support dpm up to 7 */
 	u32				smu_dpm_max;
+	u32				smu_rev;
+	const struct dpm_clk		*smu_npu_dpm_clk_table;
+	u32				smu_npu_dpm_levels;
 #ifdef AMDXDNA_DEVEL
 	struct rt_config		priv_load_cfg;
 #endif
@@ -242,6 +281,7 @@ struct amdxdna_dev_priv {
 
 /* aie2_pci.c */
 extern const struct amdxdna_dev_ops aie2_ops;
+int aie2_check_protocol(struct amdxdna_dev_hdl *ndev, u32 fw_major, u32 fw_minor);
 
 /* aie2_smu.c */
 void aie2_smu_setup(struct amdxdna_dev_hdl *ndev);
@@ -255,7 +295,8 @@ int aie2_smu_get_hclock_freq(struct amdxdna_dev_hdl *ndev);
 int aie2_smu_set_power_on(struct amdxdna_dev_hdl *ndev);
 int aie2_smu_set_power_off(struct amdxdna_dev_hdl *ndev);
 int aie2_smu_get_power_state(struct amdxdna_dev_hdl *ndev);
-int aie2_smu_set_dpm_level(struct amdxdna_dev_hdl *ndev, u32 dpm_level);
+int aie2_smu_get_dpm_level(struct amdxdna_dev_hdl *ndev);
+int aie2_smu_set_dpm_level(struct amdxdna_dev_hdl *ndev, u32 dpm_level, bool cache);
 void aie2_smu_prepare_s0i3(struct amdxdna_dev_hdl *ndev);
 
 /* aie2_psp.c */
@@ -323,5 +364,10 @@ void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
 void aie2_stop_ctx(struct amdxdna_client *client);
 void aie2_restart_ctx(struct amdxdna_client *client);
 void aie2_stop_ctx_by_col_map(struct amdxdna_client *client, u32 col_map);
+
+/* aie2_pm.c */
+int aie2_pm_start(struct amdxdna_dev_hdl *ndev);
+void aie2_pm_stop(struct amdxdna_dev_hdl *ndev);
+int aie2_pm_set_mode(struct amdxdna_dev_hdl *ndev, enum amdxdna_power_mode_type target);
 
 #endif /* _AIE2_PCI_H_ */
