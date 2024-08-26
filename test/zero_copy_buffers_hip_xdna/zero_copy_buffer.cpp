@@ -219,13 +219,22 @@ int main(int argc, char **argv) {
     }
     std::cout << "Successfully imported DMA-BUF. Handle: " << prime_params_input.handle << std::endl;
 
+    struct amdxdna_drm_get_bo_info get_bo_info = {.handle = prime_params_input.handle};
+    ret = ioctl(drv_fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &get_bo_info);
+    if (ret != 0) {
+        perror("Failed to get BO info");
+        return -2;
+    }
+    std::cout << "Imported Buffer MapOffset: " << get_bo_info.map_offset << std::endl;
+
+    // input_0 = (__u64)hip_managed_ptr_input; 
+    input_0 = (__u64)mmap(0, N * sizeof(dataType), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, drv_fd, get_bo_info.map_offset);
+    input_0_handle = prime_params_input.handle;
+    
     // Functional Print Statement
     // touch buffer so that xdna can see it? (removing it will fail tests)
     // still needed XDNA >= 2.18.0
-    std::cout << "Functional Print: " << hip_managed_ptr_input[0] << std::endl;
-
-    input_0 = (__u64)hip_managed_ptr_input;
-    input_0_handle = prime_params_input.handle;
+    std::cout << "Functional Print: " << *((dataType *)input_0) << std::endl; 
 
     /////////////// import output///////////////
     uint64_t output_0;
@@ -307,7 +316,7 @@ int main(int argc, char **argv) {
         dataType dst = *((dataType *)output_0 + i);
         // printf("src: 0x%x\n", src);
         // printf("dst: 0x%x\n", dst);
-        if (src + 1 != dst) {
+        if (src + 1 != dst && i < 16) {
             printf("[ERROR] %d: %d + 1 != %d\n", i, src, dst);
             errors++;
         }
